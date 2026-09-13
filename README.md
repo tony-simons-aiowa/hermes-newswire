@@ -1,5 +1,7 @@
 # Hermes Newswire
 
+![Hermes Newswire](assets/hermes-newswire-hero.webp)
+
 [![](https://img.shields.io/badge/X-%40tonysimons_-1DA1F2?style=for-the-badge&logo=x&logoColor=white)](https://x.com/tonysimons_)
 [![Support the Project](https://img.shields.io/badge/Support_the_Project-X%20Money-black?style=for-the-badge&logo=x&logoColor=white)](https://x.com/tonysimons_)
 [![](https://img.shields.io/badge/tonysimons.dev-111827?style=for-the-badge&logo=googlechrome&logoColor=white)](https://tonysimons.dev)
@@ -63,6 +65,17 @@ env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q
 node --check desktop/plugin.js
 ```
 
+## Agent-friendly development
+
+Coding agents (Hermes, Codex, Claude Code, Cursor, …) start with the root
+[`AGENTS.md`](AGENTS.md) — architecture map, critical invariants, exact
+verification commands, and a definition of done. The deep reference is
+[`docs/AGENT_GUIDE.md`](docs/AGENT_GUIDE.md) (data flow, security model,
+safe-change recipes).
+
+Quick gates before any PR: `env -u PYTHONPATH <hermes-venv>/bin/python -m pytest tests/ -q` ·
+`node --check desktop/plugin.js` · `hermes plugins validate . --json`.
+
 ## Status
 
-v0.1.0 — feature-complete through M5 (backend, page, ticker, hardening) with an independent QA gate (M6). Built as a standalone unified plugin against Hermes Desktop v0.21.x plugin SDK.
+v0.1.0 — feature-complete (backend, page, ticker, hardening, search, favicons, grouping) with an independent QA-gated history. 102-test suite + ESM render smoke. Built as a standalone unified plugin against the Hermes Desktop plugin SDK (catalog submission pending).
