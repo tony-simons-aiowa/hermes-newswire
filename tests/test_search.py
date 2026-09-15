@@ -74,3 +74,22 @@ def test_search_unsafe_hostname_rejected(plugin, client):
     r2 = client.post(f"{PREFIX}/search", json={"query": "127.0.0.1"})
     assert r2.status_code == 400
     assert r2.json()["detail"]["code"] == "unsafe_url"
+
+
+def test_search_direct_feed_url_returns_self(plugin, client, fake_fetch, monkeypatch):
+    # Pasted feed URL: the URL itself IS the feed — it must come back as a
+    # selectable candidate, not just guesses at sibling paths (RNZ regression).
+    from conftest import RSS2, outcome
+    monkeypatch.setattr(plugin, "_resolve_host_sync", lambda host: ["93.184.216.34"])
+    fake_fetch({
+        "https://feed.example/today.xml": lambda h: outcome(plugin, RSS2),
+    })
+    r = client.post(f"{PREFIX}/search", json={"query": "https://feed.example/today.xml"})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["via"] == "discovery"
+    assert d["results"], "direct feed URL must yield at least itself"
+    first = d["results"][0]
+    assert first.get("is_feed") is True
+    assert first.get("feed_url") == "https://feed.example/today.xml"
+    assert first.get("title") == "Example RSS2"

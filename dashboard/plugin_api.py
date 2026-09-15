@@ -1467,8 +1467,19 @@ async def discover(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     if outcome.status != 200:
         raise _err(502, "fetch_failed", f"HTTP {outcome.status} fetching {url}")
 
-    candidates = discover_in_html(url, outcome.body)
+    # The URL itself may BE the feed (pasted feed URL): list it first so the
+    # UI can offer it directly instead of only guessing sibling paths.
+    ctype_self = outcome.headers.get("content-type", "")
     results = []
+    if looks_like_feed(outcome.body, ctype_self):
+        try:
+            feed_self = parse_feed(outcome.body, ctype_self)
+        except (ET.ParseError, ValueError, json.JSONDecodeError):
+            pass
+        else:
+            results.append({"url": url, "is_feed": True,
+                            "title": feed_self.get("title"), "format": feed_self.get("format")})
+    candidates = discover_in_html(url, outcome.body)
     for cand in candidates[:MAX_DISCOVERY_PROBES]:
         entry: dict[str, Any] = {"url": cand}
         try:
@@ -1588,6 +1599,17 @@ async def _discover_url(url: str) -> list[dict[str, Any]]:
         raise _err(502, "fetch_failed", f"could not fetch {url}: {exc}") from exc
     if outcome.status != 200:
         raise _err(502, "fetch_failed", f"HTTP {outcome.status} fetching {url}")
+    # The URL itself may BE the feed (pasted feed URL): return it directly
+    # instead of guessing sibling paths off its host.
+    ctype_self = outcome.headers.get("content-type", "")
+    if looks_like_feed(outcome.body, ctype_self):
+        try:
+            feed_self = parse_feed(outcome.body, ctype_self)
+        except (ET.ParseError, ValueError, json.JSONDecodeError):
+            pass
+        else:
+            return [{"url": url, "feed_url": url, "is_feed": True,
+                     "title": feed_self.get("title"), "format": feed_self.get("format")}]
     candidates = discover_in_html(url, outcome.body)
     results: list[dict[str, Any]] = []
     for cand in candidates[:MAX_DISCOVERY_PROBES]:
