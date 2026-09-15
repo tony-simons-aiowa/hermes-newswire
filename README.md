@@ -52,7 +52,7 @@ RSS 2.0, RSS 1.0/RDF, Atom, JSON Feed. Discovery: `<link rel="alternate">` tags 
 
 ## Security
 
-Source URLs are untrusted: http/https only (no file/ftp), loopback/private/link-local/CGNAT/metadata addresses blocked (literal, hex/octal legacy forms, AND post-DNS resolution), redirects validated per hop (max 3), 5s connect / 15s total timeouts, 5 MB body cap, all feed HTML stripped before storage. OPML import validates every URL through the same gates. No telemetry, no remote service, no secrets.
+Source URLs are untrusted: http/https only (no file/ftp), loopback/private/link-local/CGNAT/metadata addresses blocked (literal, hex/octal legacy forms, AND post-DNS resolution), redirects validated per hop (max 3), 5s connect / 15s total timeouts, 5 MB body cap, all feed HTML stripped before storage. OPML import validates every URL through the same gates. Self-hosted feed generators (e.g. RSSHub on `localhost`) can be opted in per exact `host:port` via a `trusted_endpoints.txt` file at the plugin root — see `trusted_endpoints.txt.example`. No telemetry, no remote service, no secrets.
 
 ## Settings
 

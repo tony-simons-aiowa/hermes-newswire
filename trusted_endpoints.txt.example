@@ -1,0 +1,5 @@
+# Opt-in trusted endpoints for self-hosted feed generators (local patch).
+# One "host:port" per line (port omitted = scheme default, 443 https / 80 http).
+# Exact match only, no wildcards. Only list services you run and trust.
+# Copy to trusted_endpoints.txt next to this file to enable.
+# localhost:1200

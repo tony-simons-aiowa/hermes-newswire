@@ -371,6 +371,35 @@ def _ip_is_blocked(ip_text: str) -> bool:
     return False
 
 
+# --- LOCAL PATCH (self-hosted feeds): opt-in trusted endpoints ----------------
+# Upstream SSRF policy requires every source URL to resolve to public IPs only,
+# which forbids self-hosted feed generators on the same machine (RSSHub, ...).
+# Opt back in per exact host:port via a plain text file at the plugin root:
+#   ~/.hermes/plugins/hermes-newswire/trusted_endpoints.txt
+# One "host:port" per line, '#' comments, exact match only, no wildcards.
+# File missing or empty = upstream behavior 100% unchanged.
+_TRUSTED_ENDPOINTS_FILE = Path(__file__).resolve().parent.parent / "trusted_endpoints.txt"
+
+
+def _trusted_endpoint(host: str, port: int | None, scheme: str) -> bool:
+    try:
+        lines = _TRUSTED_ENDPOINTS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    default_port = 443 if scheme.lower() == "https" else 80
+    h = (host or "").lower()
+    port = port if port else default_port
+    wants = {f"{h}:{port}"}
+    if port == default_port:  # a portless line means "scheme default port"
+        wants.add(h)
+    return any(
+        line.strip().lower() in wants
+        for line in lines
+        if line.strip() and not line.strip().startswith("#")
+    )
+# --- END LOCAL PATCH ----------------------------------------------------------
+
+
 def _resolve_validated_ips(url: str) -> list[str]:
     """SSRF gate: return the addresses a URL may be contacted on, or raise.
 
@@ -388,6 +417,24 @@ def _resolve_validated_ips(url: str) -> list[str]:
     host = parts.hostname
     if not host:
         raise UnsafeURL(f"no hostname in URL: {url!r}")
+    # --- LOCAL PATCH: skip the public-IP policy for opt-in trusted endpoints ---
+    # Exact host:port match against trusted_endpoints.txt (see helper above).
+    # Resolution still happens so the caller's IP pinning stays intact; only the
+    # public-IP policy is skipped, for this one endpoint explicitly opted in.
+    try:
+        _explicit_port = parts.port
+    except ValueError:
+        _explicit_port = None
+    if _trusted_endpoint(host, _explicit_port, parts.scheme or ""):
+        try:
+            ipaddress.ip_address(host)
+            return [host]
+        except ValueError:
+            resolved = _resolve_host_sync(host)
+            if not resolved:
+                raise UnsafeURL(f"cannot resolve host: {host!r}")  # noqa: B904
+            return resolved
+    # --- END LOCAL PATCH ---
     # Literal IP: check directly. Hostname: every resolved address must be public.
     try:
         ipaddress.ip_address(host)
