@@ -56,7 +56,8 @@ class FakeFetch:
         self.responses = responses
         self.calls: list[tuple[str, dict[str, str]]] = []
 
-    async def __call__(self, url: str, *, headers: dict[str, str] | None = None):
+    async def __call__(self, url: str, *, headers: dict[str, str] | None = None,
+                       max_bytes: int | None = None):
         import inspect
 
         self.calls.append((url, dict(headers or {})))

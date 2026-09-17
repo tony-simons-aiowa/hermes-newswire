@@ -582,3 +582,33 @@ async def test_host_header_is_original_hostname(plugin, monkeypatch):
     hosts_by_dial = {ip: host for ip, _target, host in dialer.requests}
     assert hosts_by_dial["93.184.216.34"] == "example.com"
     assert hosts_by_dial["8.8.8.8"] == "other.example"
+
+
+# ---------------------------------------------------------------------------
+# Favicon/image path (issue #6): same pin gate as feed fetch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_icon_fetch_rebind_second_answer_never_dialed(plugin, monkeypatch):
+    """Remote icons go through _http_fetch, so a rebind cannot land on loopback.
+
+    Validation sees 93.184.216.34; every later resolution would return
+    127.0.0.1. The icon fetch must dial only the validated IP (RefusingDialer
+    records the connect_tcp target without needing a real HTTP conversation).
+    """
+    calls = {"n": 0}
+
+    def rebind_dns(host):
+        calls["n"] += 1
+        return ["93.184.216.34"] if calls["n"] == 1 else ["127.0.0.1"]
+
+    monkeypatch.setattr(plugin, "_resolve_host_sync", rebind_dns)
+    dialer = RefusingDialer()
+    install(plugin, monkeypatch, dialer)
+
+    with pytest.raises(RuntimeError, match="network error"):
+        await plugin._fetch_icon("http://icons.example/fav.png")
+    assert calls["n"] == 1
+    assert dialer.ips == ["93.184.216.34"]
+    assert "127.0.0.1" not in dialer.ips

@@ -50,9 +50,16 @@ cache (React Query) and renders normalized plain text.
   `last_error`; no re-fetch churn).
 - **Retention** (`_apply_retention`): deletes articles older than
   `max_article_age_hours`; caps total rows at `max_headlines`.
-- **Favicons** (`_favicon_for_source`): stored Feedly `icon_url` (validated
-  public http(s)) else Google s2 over the SITE domain — `feeds.`/`rss.`/
-  `www.` prefixes stripped so the brand shows, not the feed host.
+- **Favicons** (`_favicon_remote_url` / `_fetch_icon`): stored Feedly
+  `icon_url` (validated public http(s)) else Google s2 over the SITE
+  domain — `feeds.`/`rss.`/`www.` prefixes stripped so the brand shows,
+  not the feed host. The renderer never loads that remote URL. JSON
+  `favicon_url` is a same-origin proxy path
+  (`/api/plugins/hermes-newswire/sources/{id}/icon`); the backend fetches
+  through `_http_fetch` (pinned), caps at `MAX_ICON_BYTES` (256 KB),
+  sniffs raster magic bytes (PNG/JPEG/GIF/WebP/ICO/BMP/AVIF; no SVG),
+  caches in-process, and serves bytes or a JSON data-URL twin
+  (`/icon.json`) for `ctx.rest`.
 - **Error isolation**: every fetch/parse failure is captured on the source
   row (`last_error`, `error_count`); sources are NEVER auto-disabled.
 - **Routes**: sources CRUD (+ per-source refresh), `/articles` (filters:
@@ -99,9 +106,9 @@ chains, and HTML/script injection. Accordingly:
   reused for a different hostname (`MAX_REDIRECTS=3` still applies).
 - `_http_fetch` caps: `MAX_REDIRECTS=3`, `CONNECT_TIMEOUT=5s`,
   `TOTAL_TIMEOUT=15s`, `MAX_BODY_BYTES=5MB` (streaming, aborted mid-body).
-- Favicons: the backend never fetches favicon URLs — it only validates them
-  (`_assert_public_http_url` / `_is_safe_image_url`) and returns them to
-  the renderer, which loads them as frontend `<img>` sources.
+- Favicons: remote icon URLs are fetched only through `_fetch_icon` →
+  `_http_fetch` (pinned, 256 KB cap, raster sniff). The renderer receives
+  a same-origin proxy path / data URL, never a remote `<img src>`.
 - `strip_html` removes all markup before storage; the renderer renders
   plain text only. Do not add rich HTML rendering of feed content.
 - Policy rejections surface as `400 unsafe_url` (client error), distinct
@@ -144,8 +151,8 @@ gate.
   Native `<select>` options must set explicit theme-solid backgrounds
   (dark popup; `--ui-bg-elevated` for the closed control —
   `--ui-bg-input` is a LIGHT field color in this theme system).
-- **Favicons**: eager `<img loading>` removed — lazy images never load
-  inside a moving marquee.
+- **Favicons**: `SourceFavicon` loads `/sources/{id}/icon.json` (data URL)
+  and never points `<img src>` at a remote host.
 
 ## Testing
 

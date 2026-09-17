@@ -1,5 +1,5 @@
 name: hermes-newswire
-version: 0.1.0
+version: 0.1.1
 description: "Breaking-news ticker for Hermes Desktop: a continuously scrolling RSS/Atom/JSON-Feed strip docked above the statusbar with per-source favicons, feed search + discovery, grouping modes, offline cache, and in-app article reading. Zero API keys, zero model tokens for routine operation."
 author: tony-simons-aiowa
 kind: standalone

@@ -6,7 +6,7 @@
 [![Support the Project](https://img.shields.io/badge/Support_the_Project-X%20Money-black?style=for-the-badge&logo=x&logoColor=white)](https://x.com/tonysimons_)
 [![](https://img.shields.io/badge/tonysimons.dev-111827?style=for-the-badge&logo=googlechrome&logoColor=white)](https://tonysimons.dev)
 [![License: MIT](https://img.shields.io/badge/license-MIT-6c63ff?style=for-the-badge)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-119%20passed-brightgreen?style=for-the-badge)](#test--verify)
+[![Tests](https://img.shields.io/badge/tests-127%20passed-brightgreen?style=for-the-badge)](#test--verify)
 [![Zero API keys](https://img.shields.io/badge/zero-API%20keys-00d26a?style=for-the-badge)](#security)
 [![No LLM tokens](https://img.shields.io/badge/routine%20ops-no%20model%20tokens-00d26a?style=for-the-badge)](#security)
 
@@ -52,7 +52,7 @@ RSS 2.0, RSS 1.0/RDF, Atom, JSON Feed. Discovery: `<link rel="alternate">` tags 
 
 ## Security
 
-Source URLs are untrusted: http/https only (no file/ftp), loopback/private/link-local/CGNAT/metadata addresses blocked (literal, hex/octal legacy forms, AND post-DNS resolution), redirects validated per hop (max 3), 5s connect / 15s total timeouts, 5 MB body cap, all feed HTML stripped before storage. OPML import validates every URL through the same gates. No telemetry, no remote service, no secrets.
+Source URLs are untrusted: http/https only (no file/ftp), loopback/private/link-local/CGNAT/metadata addresses blocked (literal, hex/octal legacy forms, AND post-DNS resolution), redirects validated per hop (max 3), 5s connect / 15s total timeouts, 5 MB body cap, all feed HTML stripped before storage. Favicon/image URLs use the same pinned fetch path (256 KB cap, raster-only) and are never loaded as remote `<img src>`. OPML import validates every URL through the same gates. No telemetry, no remote service, no secrets.
 
 ## Settings
 
@@ -78,4 +78,4 @@ Quick gates before any PR: `env -u PYTHONPATH <hermes-venv>/bin/python -m pytest
 
 ## Status
 
-v0.1.0 — feature-complete (backend, page, ticker, hardening, search, favicons, grouping) with an independent QA-gated history. 119-test suite + ESM render smoke. Built as a standalone unified plugin against the Hermes Desktop plugin SDK (catalog submission pending).
+v0.1.1 — feature-complete (backend, page, ticker, hardening, search, favicons, grouping) with an independent QA-gated history. 127-test suite + ESM render smoke. Built as a standalone unified plugin against the Hermes Desktop plugin SDK (catalog submission pending).

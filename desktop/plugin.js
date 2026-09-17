@@ -330,6 +330,39 @@ function useSources() {
   return [q, Array.isArray(q.data) ? q.data : []]
 }
 
+// Favicons: never load remote URLs in <img>. The backend fetches through the
+// pinned transport and returns a data URL via /sources/{id}/icon.json.
+const iconDataUrls = new Map()
+
+function SourceFavicon({ sourceId, className, fallback }) {
+  const [src, setSrc] = useState(() => (sourceId && iconDataUrls.get(sourceId)) || '')
+  useEffect(() => {
+    if (!sourceId || !rest) return
+    if (iconDataUrls.has(sourceId)) {
+      const cached = iconDataUrls.get(sourceId) || ''
+      setSrc(cached)
+      return
+    }
+    let cancelled = false
+    rest(`/sources/${sourceId}/icon.json`).then(out => {
+      const url = (out && out.data_url) || ''
+      iconDataUrls.set(sourceId, url)
+      if (!cancelled) setSrc(url)
+    }).catch(() => {
+      iconDataUrls.set(sourceId, '')
+      if (!cancelled) setSrc('')
+    })
+    return () => { cancelled = true }
+  }, [sourceId])
+  if (!src) return fallback || null
+  return jsx('img', {
+    src,
+    className: className || `${ID}-favicon`,
+    alt: '',
+    onError: e => { e.currentTarget.style.display = 'none' }
+  })
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Ticker (statusbar)
 // ─────────────────────────────────────────────────────────────────────────
@@ -349,10 +382,10 @@ function TickerItem({ a, settings }) {
     children: jsxs('span', {
       style: { display: 'inline-flex', alignItems: 'center', gap: '0.375rem' },
       children: [
-        a.favicon_url
-          ? jsx('img', { src: a.favicon_url, className: `${ID}-favicon`, alt: '',
-              onError: e => { e.currentTarget.style.display = 'none' } })
-          : jsx('span', { className: `${ID}-dot`, children: '◆' }),
+        jsx(SourceFavicon, {
+          sourceId: a.source_id,
+          fallback: jsx('span', { className: `${ID}-dot`, children: '◆' })
+        }),
         settings?.show_source !== false ? jsx('span', { className: `${ID}-src`, children: `${a.source_name}:` }) : null,
         jsx('span', { className: `${ID}-headline`, children: a.title }),
         age ? jsx('span', { className: `${ID}-age`, children: `· ${age}` }) : null
@@ -558,8 +591,7 @@ function ArticleRow({ a }) {
         }),
         a.summary ? jsx('div', { className: `${ID}-rowsum`, children: a.summary }) : null,
         jsxs('div', { className: `${ID}-meta`, children: [
-          a.favicon_url ? jsx('img', { src: a.favicon_url, className: `${ID}-favicon`, alt: '',
-            onError: e => { e.currentTarget.style.display = 'none' } }) : null,
+          jsx(SourceFavicon, { sourceId: a.source_id }),
           jsx('span', { children: a.source_name }),
           a.read ? jsx('span', { children: '· read' }) : null,
           jsx('span', { title: absTime(a.published_at), children: relTime(a.published_at) || '—' })
@@ -651,7 +683,7 @@ function LatestTab({ sources, prefs, setPrefs }) {
       const bySrc = new Map()
       for (const a of filtered) {
         const k = a.source_id ?? a.source_name
-        if (!bySrc.has(k)) bySrc.set(k, { name: a.source_name, favicon: a.favicon_url, list: [] })
+        if (!bySrc.has(k)) bySrc.set(k, { name: a.source_name, sourceId: a.source_id, list: [] })
         bySrc.get(k).list.push(a)
       }
       const blocks = [...bySrc.values()].map(b => {
@@ -725,7 +757,7 @@ function LatestTab({ sources, prefs, setPrefs }) {
               ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(EmptyState, { title: needle ? 'No matching headlines' : 'No articles yet', description: needle ? 'Try a different search.' : 'Add a source and refresh.' }) })
               : jsx('div', { className: `${ID}-list`, children: sections.map((sec, si) => jsxs('div', { 'data-section': si, children: [
                   sec.name ? jsxs('div', { className: `${ID}-section`, children: [
-                    sec.favicon ? jsx('img', { src: sec.favicon, className: `${ID}-favicon`, alt: '' }) : null,
+                    jsx(SourceFavicon, { sourceId: sec.sourceId }),
                     jsx('span', { children: sec.name }),
                     jsx('span', { className: `${ID}-sectioncount`, children: `${sec.list.length}` })
                   ] }) : null,

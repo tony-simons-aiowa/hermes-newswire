@@ -41,6 +41,8 @@ Routes (all under /api/plugins/hermes-newswire/):
     PATCH  /sources/{id}
     DELETE /sources/{id}
     POST   /sources/{id}/refresh
+    GET    /sources/{id}/icon          raster bytes (pinned fetch, cached)
+    GET    /sources/{id}/icon.json     JSON twin {data_url, content_type} for ctx.rest
     GET    /articles                   ?limit&offset&source_id&unread&include_summary
     POST   /articles/{id}/read         body {"read": true|false}
     POST   /articles/read-all          body {"source_id":?}
@@ -56,6 +58,7 @@ Routes (all under /api/plugins/hermes-newswire/):
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import html as html_mod
 import ipaddress
@@ -83,7 +86,7 @@ except Exception:  # pragma: no cover - defensive fallback
     def get_hermes_home() -> Path:  # type: ignore[misc]
         return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 USER_AGENT = f"hermes-newswire/{PLUGIN_VERSION} (+https://github.com/NousResearch/hermes-agent)"
 
 # ---------------------------------------------------------------------------
@@ -95,6 +98,8 @@ MAX_REDIRECTS = 3
 CONNECT_TIMEOUT = 5.0
 TOTAL_TIMEOUT = 15.0
 MAX_BODY_BYTES = 5 * 1024 * 1024        # 5 MB
+MAX_ICON_BYTES = 256 * 1024             # favicons only; smaller than the feed cap
+ICON_CACHE_TTL_SEC = 24 * 3600
 SUMMARY_MAX_CHARS = 2000
 MAX_DISCOVERY_PROBES = 10
 # Hard ceiling on new article rows a single refresh may insert, however large
@@ -344,6 +349,10 @@ class UnsafeURL(Exception):
     """Raised when a URL (or redirect target) violates the SSRF policy."""
 
 
+class NotImage(Exception):
+    """Raised when an icon fetch did not return a raster image."""
+
+
 def _resolve_host_sync(host: str) -> list[str]:
     """Resolve a hostname to IP strings. Module seam: tests monkeypatch this."""
     try:
@@ -518,7 +527,12 @@ async def _validate_and_pin(url: str, backend: "_PinnedIPBackend | None") -> Non
             backend.pin(key, candidates)
 
 
-async def _http_fetch(url: str, *, headers: dict[str, str] | None = None) -> FetchOutcome:
+async def _http_fetch(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    max_bytes: int | None = None,
+) -> FetchOutcome:
     """GET with SSRF-checked, IP-pinned manual redirects, timeouts, 5 MB cap.
 
     Per hop: resolve → validate every address against the public-IP policy →
@@ -540,6 +554,7 @@ async def _http_fetch(url: str, *, headers: dict[str, str] | None = None) -> Fet
 
     current = url
     hop_headers = dict(headers or {})
+    cap = MAX_BODY_BYTES if max_bytes is None else max_bytes
     client = _build_async_client()
     pin_backend = getattr(client, "_newswire_pin_backend", None)
     if pin_backend is None and not getattr(client, "_newswire_mock_transport", False):
@@ -567,8 +582,8 @@ async def _http_fetch(url: str, *, headers: dict[str, str] | None = None) -> Fet
                     body = b""
                     async for chunk in resp.aiter_bytes():
                         body += chunk
-                        if len(body) > MAX_BODY_BYTES:
-                            raise UnsafeURL(f"response body exceeds {MAX_BODY_BYTES} bytes")
+                        if len(body) > cap:
+                            raise UnsafeURL(f"response body exceeds {cap} bytes")
                     return FetchOutcome(
                         status=resp.status_code,
                         headers={k.lower(): v for k, v in resp.headers.items()},
@@ -748,10 +763,14 @@ def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
 
 
 
-def _favicon_for_source(row: sqlite3.Row) -> str:
-    """Best favicon URL for a source: stored Feedly/website icon, else the
-    Google s2 favicon service over the site domain (never the feed host —
-    feedburner et al would show the wrong brand). Empty when nothing derivable."""
+def _favicon_remote_url(row: sqlite3.Row) -> str:
+    """Remote icon URL the backend will fetch: stored Feedly/website icon, else
+    the Google s2 favicon service over the site domain (never the feed host —
+    feedburner et al would show the wrong brand). Empty when nothing derivable.
+
+    This URL is never handed to the renderer as an ``<img src>`` — it is only
+    fetched through ``_fetch_icon`` / the pinned transport.
+    """
     def col(*names: str) -> str:
         for n in names:
             if n in row.keys():
@@ -775,6 +794,93 @@ def _favicon_for_source(row: sqlite3.Row) -> str:
             domain = ".".join(parts)
             return f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
     return ""
+
+
+def _favicon_proxy_url(source_id: int) -> str:
+    return f"/api/plugins/hermes-newswire/sources/{int(source_id)}/icon"
+
+
+def _favicon_for_source(row: sqlite3.Row) -> str:
+    """Same-origin proxy path the renderer may use as ``<img src>``.
+
+    The remote URL stays server-side. Empty when nothing derivable.
+    """
+    if not _favicon_remote_url(row):
+        return ""
+    keys = row.keys()
+    if "source_id" in keys and row["source_id"]:
+        sid = row["source_id"]
+    else:
+        sid = row["id"]
+    return _favicon_proxy_url(sid)
+
+
+# url -> (expires_at, body, content_type)
+_icon_mem: dict[str, tuple[float, bytes, str]] = {}
+
+
+def _sniff_raster_image(body: bytes) -> str | None:
+    """Return a safe raster image/* type from magic bytes, or None.
+
+    SVG/HTML/XML are rejected even if a Content-Type claims image/*.
+    """
+    if len(body) < 12:
+        return None
+    png_magic = bytes((0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))
+    ico_magic = bytes((0x00, 0x00, 0x01, 0x00))
+    cur_magic = bytes((0x00, 0x00, 0x02, 0x00))
+    if body.startswith(png_magic):
+        return "image/png"
+    if body.startswith(bytes((0xFF, 0xD8, 0xFF))):
+        return "image/jpeg"
+    if body.startswith(b"GIF87a") or body.startswith(b"GIF89a"):
+        return "image/gif"
+    if body.startswith(b"RIFF") and body[8:12] == b"WEBP":
+        return "image/webp"
+    if body.startswith(ico_magic) or body.startswith(cur_magic):
+        return "image/x-icon"
+    if body.startswith(b"BM"):
+        return "image/bmp"
+    if body[4:8] == b"ftyp" and body[8:12] in (b"avif", b"avis"):
+        return "image/avif"
+    return None
+
+
+async def _fetch_icon(url: str) -> tuple[bytes, str]:
+    """Fetch an icon through ``_http_fetch`` (pinned), with a tight size cap.
+
+    Returns ``(body, content_type)``. Raises ``UnsafeURL``, ``NotImage``, or
+    a generic ``RuntimeError`` on upstream failure. Cached in-process by URL.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    hit = _icon_mem.get(url)
+    if hit and hit[0] > now:
+        return hit[1], hit[2]
+    outcome = await _http_fetch(
+        url,
+        headers={"Accept": "image/*,*/*;q=0.1"},
+        max_bytes=MAX_ICON_BYTES,
+    )
+    if outcome.status != 200:
+        raise RuntimeError(f"HTTP {outcome.status} fetching icon")
+    if len(outcome.body) > MAX_ICON_BYTES:
+        raise UnsafeURL(f"response body exceeds {MAX_ICON_BYTES} bytes")
+    sniffed = _sniff_raster_image(outcome.body)
+    if not sniffed:
+        raise NotImage("response is not a raster image")
+    declared = (outcome.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if declared in {"image/svg+xml", "text/html", "application/xml", "text/xml"}:
+        raise NotImage(f"refusing content-type {declared}")
+    _icon_mem[url] = (now + ICON_CACHE_TTL_SEC, outcome.body, sniffed)
+    return outcome.body, sniffed
+
+
+def _icon_payload(body: bytes, content_type: str) -> dict[str, str]:
+    b64 = base64.b64encode(body).decode("ascii")
+    return {
+        "content_type": content_type,
+        "data_url": f"data:{content_type};base64,{b64}",
+    }
 
 
 def _source_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -1370,6 +1476,45 @@ def delete_source(source_id: int) -> dict[str, Any]:
     return {"deleted": source_id, "articles_removed": deleted}
 
 
+async def _source_icon_bytes(source_id: int) -> tuple[bytes, str]:
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+        if row is None:
+            raise _err(404, "not_found", f"source {source_id} not found")
+    remote = _favicon_remote_url(row)
+    if not remote:
+        raise _err(404, "no_icon", "source has no icon URL")
+    try:
+        return await _fetch_icon(remote)
+    except UnsafeURL as exc:
+        raise _err(400, "unsafe_url", str(exc)) from exc
+    except NotImage as exc:
+        raise _err(502, "not_image", str(exc)) from exc
+    except Exception as exc:
+        raise _err(502, "fetch_failed", f"could not fetch icon: {exc}") from exc
+
+
+@router.get("/sources/{source_id}/icon.json")
+async def source_icon_json(source_id: int) -> dict[str, str]:
+    """JSON twin of /icon for ctx.rest (which JSON-decodes responses)."""
+    body, ctype = await _source_icon_bytes(source_id)
+    return _icon_payload(body, ctype)
+
+
+@router.get("/sources/{source_id}/icon")
+async def source_icon(source_id: int) -> Response:
+    """Raster bytes fetched through the pinned transport, never a remote URL."""
+    body, ctype = await _source_icon_bytes(source_id)
+    return Response(
+        content=body,
+        media_type=ctype,
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @router.post("/sources/{source_id}/refresh")
 async def refresh_one(source_id: int) -> dict[str, Any]:
     with _db() as conn:
@@ -1422,8 +1567,7 @@ def list_articles(
     items = []
     for r in rows:
         item = _article_row(r, include_summary=include_summary, source_name=r["source_name"])
-        stored = (r["stored_favicon"] or "").strip() if "stored_favicon" in r.keys() else ""
-        item["favicon_url"] = stored or _favicon_for_source(r)
+        item["favicon_url"] = _favicon_for_source(r)
         items.append(item)
     return {
         "items": items,
