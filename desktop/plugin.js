@@ -224,6 +224,9 @@ function absTime(iso) {
 // pull the human message out of the JSON blob when it's there.
 function errText(e) {
   const raw = String(e?.message || e || '')
+  if (/plugin not found/i.test(raw)) {
+    return 'Plugin not found (404). The Python backend is not mounted.'
+  }
   const m = /"message"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw)
   if (m) {
     try { return JSON.parse(`"${m[1]}"`) } catch { /* fall through */ }
@@ -231,7 +234,7 @@ function errText(e) {
   return raw.slice(0, 300)
 }
 
-// Shared banner for a failed page-level query (settings, sources). Before
+// Shared banner for a failed page-level query (settings, sources, articles). Before
 // this, a query that never resolved rendered as an eternal spinner — the
 // user-visible symptom of "Settings does nothing" when the backend is
 // missing, disabled, or the serve child predates the plugin. The banner
@@ -777,7 +780,7 @@ function LatestTab({ sources, prefs, setPrefs }) {
         arts.isLoading
           ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(GlyphSpinner, {}) })
           : arts.isError
-            ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(ErrorState, { title: 'Could not load articles', description: errText(arts.error) }) })
+            ? jsx('div', { className: 'p-4', children: jsx(QueryErrorBanner, { q: arts, label: 'articles' }) })
             : sections.every(s => s.list.length === 0)
               ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(EmptyState, { title: needle ? 'No matching headlines' : 'No articles yet', description: needle ? 'Try a different search.' : 'Add a source and refresh.' }) })
               : jsx('div', { className: `${ID}-list`, children: sections.map((sec, si) => jsxs('div', { 'data-section': si, children: [
