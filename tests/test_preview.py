@@ -38,6 +38,11 @@ def test_preview_emits_gateway_event(plugin, client, monkeypatch):
     monkeypatch.setitem(sys.modules, "tui_gateway", gw_pkg)
     monkeypatch.setitem(sys.modules, "tui_gateway.server", fake)
 
+    # The SSRF gate resolves the hostname for real, which makes this test hostage to
+    # the machine's DNS (a filtering resolver refuses example.com here). Stub the
+    # plugin's own documented seam so the assertion is about the preview event only.
+    monkeypatch.setattr(plugin, "_resolve_host_sync", lambda host: ["93.184.216.34"])
+
     r = client.post(f"{PREFIX}/preview", json={"url": "https://example.com/story", "label": "Story"})
     assert r.status_code == 200, r.text
     assert r.json()["opened"] == "https://example.com/story"

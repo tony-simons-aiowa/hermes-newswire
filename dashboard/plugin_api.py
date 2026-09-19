@@ -116,6 +116,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "relative_time": True,
     "open_article_behavior": "internal",   # internal (preview pane) | external (OS browser)
     "only_unread": False,
+    # --- Signal lanes (2026-09-17: news · trades · agent) ---
+    "ticker_lanes": {"news": True, "trades": True, "agent": True},
+    "hl_address": "0x09F60D19350BE74a0B95cCf1911b8283d976BBf7",
+    "hl_poll_interval": 60,
+    "watchlist": ["HYPE", "BTC", "ETH", "SOL"],
+    "notify_on_watch": True,
+    "pins_enabled": True,
 }
 _TICKER_SPEEDS = {"slow", "normal", "fast"}
 
@@ -471,6 +478,7 @@ CREATE TABLE IF NOT EXISTS sources (
   name TEXT NOT NULL,
   url TEXT NOT NULL DEFAULT '',
   feed_url TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL DEFAULT 'feed',
   enabled INTEGER NOT NULL DEFAULT 1,
   category TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
@@ -541,6 +549,8 @@ def _db() -> Iterator[sqlite3.Connection]:
                 """UPDATE sources SET articles_ever = (
                        SELECT COUNT(*) FROM articles WHERE articles.source_id = sources.id)"""
             )
+        if "kind" not in cols:
+            conn.execute("ALTER TABLE sources ADD COLUMN kind TEXT NOT NULL DEFAULT 'feed'")
         yield conn
         conn.commit()
     finally:
@@ -607,6 +617,7 @@ def _source_row(row: sqlite3.Row) -> dict[str, Any]:
         "name": row["name"],
         "url": row["url"],
         "feed_url": row["feed_url"],
+        "kind": (row["kind"] if "kind" in row.keys() else "feed"),
         "enabled": bool(row["enabled"]),
         "category": row["category"],
         "created_at": row["created_at"],
@@ -692,6 +703,8 @@ async def refresh_source(source_id: int) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
         if row is None:
             return {"source_id": source_id, "ok": False, "error": "source not found"}
+        if row["kind"] == "telegram":
+            return await _refresh_telegram_source(source_id, row)
         feed_url, etag, lm, name = row["feed_url"], row["etag"], row["last_modified"], row["name"]
 
     now = _now_iso()
@@ -1055,6 +1068,32 @@ async def add_source(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         except (TypeError, ValueError):
             raise _err(400, "bad_refresh_interval", "refresh_interval must be int in [30, 86400]") from None
 
+    kind = str(payload.get("kind") or "feed").strip() or "feed"
+    if kind not in {"feed", "telegram"}:
+        raise _err(400, "bad_kind", "kind must be 'feed' or 'telegram'")
+
+    # Telegram: no feed probe — the t.me/s channel preview is HTML, parsed by
+    # the telegram refresh branch. Accept t.me/<user> or t.me/s/<user>, store
+    # the normalized preview URL; the first refresh ingests current posts.
+    if kind == "telegram":
+        m = re.fullmatch(r"https?://(?:t\.me|telegram\.me)/s?/?([A-Za-z0-9_]{2,64})/?", url)
+        if not m:
+            raise _err(400, "bad_telegram_url", "telegram sources must be https://t.me/s/<username>")
+        tg_feed = f"https://t.me/s/{m.group(1)}"
+        now = _now_iso()
+        with _db() as conn:
+            dup = conn.execute("SELECT id FROM sources WHERE feed_url=?", (tg_feed,)).fetchone()
+            if dup:
+                raise _err(409, "duplicate", f"source already exists (id {dup['id']}) for {tg_feed}")
+            cur = conn.execute(
+                """INSERT INTO sources (name, url, feed_url, kind, enabled, category, created_at, updated_at, refresh_interval)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (name or m.group(1), tg_feed, tg_feed, "telegram", int(enabled), category, now, now, refresh_interval),
+            )
+            sid = cur.lastrowid
+            row = conn.execute("SELECT * FROM sources WHERE id=?", (sid,)).fetchone()
+        return {"source": _source_row(row), "articles_added": 0}
+
     # Feed or site? Fetch once; if it's not a feed, discover candidates on the page.
     try:
         outcome = await _http_fetch(url)
@@ -1215,6 +1254,8 @@ def list_articles(
     unread: bool = Query(False),
     include_summary: bool = Query(True),
     include_disabled_sources: bool = Query(False),
+    watch: bool = Query(False),
+    severity: str | None = Query(None, pattern="^(high|normal)$"),
 ) -> dict[str, Any]:
     where, vals = [], []
     if source_id is not None:
@@ -1227,7 +1268,9 @@ def list_articles(
     if not include_disabled_sources:
         where.append("s.enabled=1")
     clause = f"WHERE {' AND '.join(where)}" if where else ""
+    watch_rx = None
     with _db() as conn:
+        watch_rx = _watch_regex(conn)
         total = conn.execute(
             f"""SELECT COUNT(*) c FROM articles a
                 JOIN sources s ON s.id = a.source_id {clause}""",
@@ -1248,7 +1291,16 @@ def list_articles(
         item = _article_row(r, include_summary=include_summary, source_name=r["source_name"])
         stored = (r["stored_favicon"] or "").strip() if "stored_favicon" in r.keys() else ""
         item["favicon_url"] = stored or _favicon_for_source(r)
+        matched = bool(watch_rx and watch_rx.search(f"{r['title'] or ''} {r['author'] or ''} {r['summary'] or ''}"[:500]))
+        item["watch"] = matched
+        item["severity"] = "high" if matched else "normal"
+        if watch and not matched:
+            continue
+        if severity and item["severity"] != severity:
+            continue
         items.append(item)
+    if watch or severity:
+        total = len(items)
     return {
         "items": items,
         "total": total,
@@ -1322,6 +1374,46 @@ def _validate_setting(key: str, value: Any) -> Any:
         if key == "refresh_interval" and not 30 <= iv <= 86400:
             raise _err(400, "bad_range", "refresh_interval must be in [30, 86400]")
         return iv
+    if key == "ticker_lanes":
+        if not isinstance(value, dict) or not value:
+            raise _err(400, "bad_type", "ticker_lanes must be a non-empty object")
+        allowed_lanes = {"news", "trades", "agent"}
+        out = {}
+        for k, v in value.items():
+            if k not in allowed_lanes:
+                raise _err(400, "bad_lane", f"unknown lane: {k}")
+            if not isinstance(v, bool):
+                raise _err(400, "bad_type", f"ticker_lanes.{k} must be a boolean")
+            out[k] = v
+        return out
+    if key == "hl_address":
+        if not isinstance(value, str):
+            raise _err(400, "bad_type", "hl_address must be a string")
+        value = value.strip()
+        if value and not re.fullmatch(r"0x[0-9a-fA-F]{40}", value):
+            raise _err(400, "bad_address", "hl_address must be a 0x + 40-hex address")
+        return value
+    if key == "hl_poll_interval":
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            raise _err(400, "bad_type", "hl_poll_interval must be an integer") from None
+        if not 15 <= v <= 3600:
+            raise _err(400, "bad_range", "hl_poll_interval must be in [15, 3600]")
+        return v
+    if key == "watchlist":
+        if not isinstance(value, list):
+            raise _err(400, "bad_type", "watchlist must be a list of keywords")
+        out = []
+        for w in value:
+            s = str(w).strip().upper()
+            if s and s not in out:
+                out.append(s)
+        return out
+    if key in {"notify_on_watch", "pins_enabled"}:
+        if not isinstance(value, bool):
+            raise _err(400, "bad_type", f"{key} must be a boolean")
+        return value
     raise _err(400, "unknown_setting", f"unknown setting: {key}")  # unreachable
 
 
@@ -1642,3 +1734,536 @@ async def open_in_preview(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
         "preview.open", {"url": url, "label": label or url}
     )
     return {"opened": url}
+
+
+# ===========================================================================
+# Signal lanes — Hyperliquid trades (public info API, zero keys) + agent
+# health (cron registries, heartbeat files, kanban). 2026-09-17 build.
+# ===========================================================================
+
+_HL_INFO = "https://api.hyperliquid.xyz/info"
+# Spot coins that are USD-pegged — valued 1:1 rather than priced off the book.
+_HL_STABLES = {"USDC", "USDT", "USDT0", "USDE", "USDH", "DAI"}
+_HL_TIMEOUT = 10.0
+_hl_cache: dict[str, Any] = {"snapshot": None, "fetched_at": 0.0, "error": None}
+_WATCH_CACHE: dict[str, Any] = {"key": None, "re": None}
+
+# Per-coin fixed conviction floor used when the position-monitor's entry
+# signal cache is missing (mirrors _conviction_engine's token component).
+_TOKEN_FLOOR = {"BTC": 70, "ETH": 68, "SOL": 55, "HYPE": 40}
+
+
+def _watch_regex(conn: sqlite3.Connection):
+    """Compiled regex over the watchlist setting (word-boundary, case-insensitive).
+
+    Result is cached keyed on the serialized watchlist; None when empty so the
+    cheap path stays a falsy check.
+    """
+    key = json.dumps(get_setting(conn, "watchlist"), sort_keys=True)
+    if _WATCH_CACHE["key"] == key:
+        return _WATCH_CACHE["re"]
+    try:
+        words = [str(w).strip() for w in (get_setting(conn, "watchlist") or []) if str(w).strip()]
+        r = re.compile(r"\b(" + "|".join(re.escape(w) for w in words) + r")\b", re.IGNORECASE) if words else None
+    except Exception:
+        r = None
+    _WATCH_CACHE.update({"key": key, "re": r})
+    return r
+
+
+def _fmt(v: Any, nd: int = 2) -> float | None:
+    if v is None:
+        return None
+    try:
+        return round(float(v), nd)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _hl_post(payload: dict[str, Any]) -> Any:
+    """POST to the Hyperliquid public info endpoint through the shared seam
+    (test_http.py injects MockTransport via _build_async_client)."""
+    import httpx
+
+    client = _build_async_client()
+    try:
+        async with client:
+            r = await client.post(_HL_INFO, json=payload)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(f"timeout posting to {_HL_INFO}") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"network error posting to {_HL_INFO}: {exc}") from exc
+    r.raise_for_status()
+    return r.json()
+
+
+async def _hl_spot_prices() -> dict[str, float]:
+    """{coin: usd} for USDC-quoted spot pairs, from spotMeta + '@index' mids.
+
+    Only called when a NON-stable spot balance exists — a wallet holding just USDC
+    should not pay two extra API calls to learn that $1 == $1.
+    """
+    out: dict[str, float] = {}
+    try:
+        meta = await _hl_post({"type": "spotMeta"})
+        mids = await _hl_post({"type": "allMids"})
+    except Exception:
+        return out
+    for u in ((meta or {}).get("universe") or []):
+        name = str((u or {}).get("name") or "")
+        if "/" not in name or not name.upper().endswith("/USDC"):
+            continue
+        px = _fmt((mids or {}).get("@" + str((u or {}).get("index"))), 8)
+        if px:
+            out[name.split("/", 1)[0]] = px
+    return out
+
+
+def _hl_position_row(p: dict[str, Any], dex: str | None) -> dict[str, Any] | None:
+    try:
+        szi = float(p.get("szi") or 0)
+    except (TypeError, ValueError):
+        return None
+    if abs(szi) < 1e-12:
+        return None
+    entry = float(p.get("entryPx") or 0)
+    upnl = float(p.get("unrealizedPnl") or 0)
+    mark = float(p.get("positionValue") or 0) / abs(szi) if abs(szi) > 1e-12 else 0.0
+    upnl_pct = (upnl / (abs(szi) * entry)) * 100 if entry else 0.0
+    liq = float(p.get("liquidationPx") or 0)
+    liq_pct = (abs(mark - liq) / mark) * 100 if mark else None
+    lev = p.get("leverage")
+    if isinstance(lev, dict):
+        lev = lev.get("value")
+    return {
+        "coin": p.get("coin"),
+        "dex": dex,
+        "side": "LONG" if szi > 0 else "SHORT",
+        "size": abs(szi),
+        "entry_px": _fmt(entry),
+        "mark_px": _fmt(mark, 4),
+        "upnl": _fmt(upnl),
+        "upnl_pct": _fmt(upnl_pct),
+        "liq_px": _fmt(liq),
+        "liq_pct": _fmt(liq_pct),
+        "lev": _fmt(lev),
+        "margin_used": _fmt(p.get("marginUsed")),
+    }
+
+
+async def _hl_fetch(conn: sqlite3.Connection) -> dict[str, Any]:
+    addr = str(get_setting(conn, "hl_address") or "").strip()
+    if not addr or not re.fullmatch(r"0x[0-9a-fA-F]{40}", addr):
+        return {"ok": False, "error": "no_hl_address", "positions": [], "spot": [], "fills": [],
+                "account_value": None, "withdrawable": None, "fetched_at": _now_iso()}
+    try:
+        chs = await _hl_post({"type": "clearinghouseState", "user": addr, "dex": ""})
+        positions = [_hl_position_row(p.get("position") or {}, None)
+                     for p in (chs.get("assetPositions") or [])]
+        positions = [p for p in positions if p]
+
+        # HIP-3 builder DEXs margin independently (TradeXYZ, Felix, Ventuals,
+        # Kinetiq, Paragon...) — merge every clearinghouse so a held builder
+        # position never silently vanishes from the lane.
+        try:
+            dexes = await _hl_post({"type": "perpDexs"})
+        except Exception:
+            dexes = []
+        for d in (dexes or []):
+            if not isinstance(d, dict):
+                continue
+            dex = d.get("name")
+            if not dex:
+                continue
+            try:
+                dchs = await _hl_post({"type": "clearinghouseState", "user": addr, "dex": dex})
+            except Exception:
+                continue
+            for p in (dchs.get("assetPositions") or []):
+                row = _hl_position_row(p.get("position") or {}, dex)
+                if row:
+                    positions.append(row)
+
+        ms = chs.get("marginSummary") or {}
+        account_value = _fmt(ms.get("accountValue"))
+        withdrawable = _fmt(ms.get("withdrawable"))
+
+        spot_bal: list[dict[str, Any]] = []
+        try:
+            spot = await _hl_post({"type": "spotClearinghouseState", "user": addr})
+            for b in (spot.get("balances") or []):
+                try:
+                    total = float(b.get("total") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if total > 0:
+                    spot_bal.append({"coin": b.get("coin"), "total": _fmt(total, 6)})
+        except Exception:
+            pass
+
+        # Cross-ledger total. Hyperliquid keeps perp margin and spot cash in TWO ledgers:
+        # `marginSummary.accountValue` is perp equity only and reads $0 on a funded-but-flat
+        # account, so the lane needs the spot leg valued and added — otherwise the ticker
+        # shows "$0" for an account that plainly holds cash.
+        spot_rows: list[dict[str, Any]] = []
+        spot_value = 0.0
+        prices: dict[str, float] = {}
+        if any(str(b.get("coin") or "").upper() not in _HL_STABLES for b in spot_bal):
+            prices = await _hl_spot_prices()
+        for b in spot_bal:
+            coin = str(b.get("coin") or "")
+            amt = float(b.get("total") or 0)
+            px = 1.0 if coin.upper() in _HL_STABLES else prices.get(coin)
+            usd = round(amt * px, 2) if px else None          # unpriced coin: reported, not zeroed silently
+            if usd is not None:
+                spot_value += usd
+            spot_rows.append({"coin": coin, "total": b.get("total"), "usd": usd, "priced": px is not None})
+
+        fill_rows: list[dict[str, Any]] = []
+        try:
+            fills = await _hl_post({"type": "userFills", "user": addr})
+            for f in (fills or [])[:5]:
+                fill_rows.append({
+                    "coin": f.get("coin"), "dir": f.get("dir"),
+                    "sz": _fmt(f.get("sz"), 6), "px": _fmt(f.get("px"), 4),
+                    "time": f.get("time"),
+                })
+        except Exception:
+            pass
+
+        # Conviction overlay from the position monitor's entry-signal cache.
+        conviction: dict[str, int] = {}
+        try:
+            ep = Path(get_hermes_home()) / "hl_state" / "entry_signals.json"
+            if ep.exists():
+                sig = json.loads(ep.read_text("utf-8"))
+                if isinstance(sig, dict):
+                    for coin, v in sig.items():
+                        if isinstance(v, dict) and v.get("conviction") is not None:
+                            try:
+                                conviction[str(coin)] = int(v["conviction"])
+                            except (TypeError, ValueError):
+                                pass
+        except Exception:
+            pass
+        for p in positions:
+            coin = p.get("coin") or ""
+            p["conviction"] = conviction.get(coin, _TOKEN_FLOOR.get(coin))
+
+        snap = {
+            "ok": True, "error": None,
+            "fetched_at": _now_iso(),
+            "account_value": account_value,            # perp leg only (kept for compatibility)
+            "spot_value": round(spot_value, 2),        # spot leg in USD
+            "total_value": round((account_value or 0.0) + spot_value, 2),   # what the lane shows
+            "withdrawable": withdrawable,
+            "positions": positions,
+            "spot": spot_rows or spot_bal,
+            "fills": fill_rows,
+        }
+        _hl_cache.update({"snapshot": snap, "fetched_at": datetime.now(timezone.utc).timestamp(), "error": None})
+        return snap
+    except Exception as exc:  # noqa: BLE001 — lane never fails the page
+        _hl_cache["error"] = str(exc)[:300]
+        snap = dict(_hl_cache["snapshot"] or {})
+        snap["ok"] = False
+        snap["error"] = str(exc)[:300]
+        return snap
+
+
+@router.get("/trades")
+async def trades_lane() -> dict[str, Any]:
+    with _db() as conn:
+        interval = max(15, int(get_setting(conn, "hl_poll_interval") or 60))
+    cache = _hl_cache
+    fresh = (cache.get("snapshot") is not None
+             and (datetime.now(timezone.utc).timestamp() - cache.get("fetched_at", 0.0)) < interval)
+    if fresh:
+        return cache["snapshot"]
+    with _db() as conn:
+        return await _hl_fetch(conn)
+
+
+# ---------------------------------------------------------------------------
+# Agent health — cron registries, heartbeat files, kanban churn
+# ---------------------------------------------------------------------------
+
+def _profile_cron_dirs() -> list[Path]:
+    home = Path(get_hermes_home())
+    dirs = [home / "cron"]
+    for p in sorted((home / "profiles").glob("*")):
+        d = p / "cron"
+        if d.exists():
+            dirs.append(d)
+    return dirs
+
+
+def _parse_ts(iso: Any):
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _load_jobs(d: Path) -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads((d / "jobs.json").read_text("utf-8"))
+    except Exception:
+        return {}
+    return {j.get("id"): j for j in (data.get("jobs") or []) if j.get("id")}
+
+
+def _cron_failures(hours: int = 24) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=hours)
+    seen: dict[str, dict[str, Any]] = {}
+    total_events = 0
+    for d in _profile_cron_dirs():
+        jobs = _load_jobs(d)
+        edb = d / "executions.db"
+        rows: list[Any] = []
+        if edb.exists():
+            try:
+                conn = sqlite3.connect(f"file:{edb}?mode=ro", uri=True, timeout=5)
+                try:
+                    rows = conn.execute(
+                        "SELECT job_id, status, claimed_at, error FROM executions WHERE status IN ('failed','unknown')"
+                    ).fetchall()
+                except sqlite3.Error:
+                    rows = []
+                conn.close()
+            except Exception:
+                rows = []
+        for r in rows:
+            ts = _parse_ts(r[2]) if len(r) > 2 else None
+            if ts is None or ts.astimezone(timezone.utc) < cutoff:
+                continue
+            total_events += 1
+            job = jobs.get(r[0]) or {}
+            f = {
+                "job_id": r[0],
+                "name": job.get("name") or r[0],
+                "status": r[1],
+                "at": r[2],
+                "error": (r[3] or "")[:200] if len(r) > 3 else "",
+            }
+            if f["job_id"] not in seen or (f.get("at") or "") > (seen[f["job_id"]].get("at") or ""):
+                seen[f["job_id"]] = f
+        # jobs.json failure_streak surfaces chronic red jobs even between runs.
+        for j in jobs.values():
+            if j.get("enabled") and (j.get("failure_streak") or 0) > 0:
+                f = {
+                    "job_id": j.get("id"),
+                    "name": j.get("name"),
+                    "status": "streak",
+                    "at": j.get("last_run_at"),
+                    "error": (j.get("last_error") or "")[:200],
+                }
+                if f["job_id"] not in seen:
+                    seen[f["job_id"]] = f
+    uniq = sorted(seen.values(), key=lambda f: f.get("at") or "", reverse=True)
+    return {"failed_24h": len(uniq), "total_events": total_events, "jobs": uniq[:6]}
+
+
+def _heartbeat_age() -> dict[str, Any]:
+    p = Path(get_hermes_home()) / "state" / "gateway.heartbeat"
+    try:
+        data = json.loads(p.read_text("utf-8"))
+        dt = _parse_ts(data.get("updated_at"))
+        if dt is None:
+            return {"age_s": None, "ok": False}
+        age = max(0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds())
+        return {"age_s": int(age), "ok": age < 900}
+    except Exception:
+        return {"age_s": None, "ok": False}
+
+
+def _ticker_age() -> dict[str, Any]:
+    now = datetime.now(timezone.utc).timestamp()
+    fresh = None
+    for d in _profile_cron_dirs():
+        try:
+            age = now - float((d / "ticker_heartbeat").read_text().strip())
+        except Exception:
+            continue
+        fresh = age if fresh is None else min(fresh, age)
+    if fresh is None:
+        return {"age_s": None, "ok": False}
+    return {"age_s": int(fresh), "ok": fresh < 300}
+
+
+def _kanban_churn() -> dict[str, Any]:
+    p = Path(get_hermes_home()) / "kanban.db"
+    if not p.exists():
+        return {"counts": {}, "latest": None}
+    try:
+        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+        counts: dict[str, int] = {}
+        for row in conn.execute("SELECT status, COUNT(*) FROM tasks GROUP BY status"):
+            counts[row[0]] = row[1]
+        latest = None
+        row = conn.execute(
+            "SELECT title, assignee, status, started_at FROM tasks ORDER BY COALESCE(started_at,0) DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            latest = {"title": row[0], "assignee": row[1], "status": row[2], "started_at": row[3]}
+        conn.close()
+        return {"counts": counts, "latest": latest}
+    except Exception:
+        return {"counts": {}, "latest": None}
+
+
+@router.get("/agent/health")
+def agent_health() -> dict[str, Any]:
+    crons = _cron_failures(24)
+    hb = _heartbeat_age()
+    tk = _ticker_age()
+    kb = _kanban_churn()
+
+    def sev(ok: bool, warn_age: int = 3600, age: int | None = None) -> str:
+        if ok:
+            return "ok"
+        if age is not None and age < warn_age:
+            return "warn"
+        return "crit"
+
+    signals = [
+        {
+            "id": "cron", "label": "Cron",
+            "level": "crit" if crons["failed_24h"] else "ok",
+            "detail": f"{crons['failed_24h']} failing / open" if crons["failed_24h"] else "all green",
+            "count": crons["failed_24h"],
+        },
+        {
+            "id": "gateway", "label": "Gateway",
+            "level": "ok" if hb.get("ok") else sev(False, 3600, hb.get("age_s")),
+            "detail": (f"{hb['age_s']}s" if hb.get("age_s") is not None else "n/a"),
+            "count": 0,
+        },
+        {
+            "id": "ticker", "label": "Ticker",
+            "level": "ok" if tk.get("ok") else sev(False, 1800, tk.get("age_s")),
+            "detail": (f"{tk['age_s']}s" if tk.get("age_s") is not None else "n/a"),
+            "count": 0,
+        },
+        {
+            "id": "kanban", "label": "Board",
+            "level": "ok",
+            "detail": ", ".join(
+                f"{k}:{v}" for k, v in (kb.get("counts") or {}).items()
+                if k in ("running", "blocked", "review", "todo", "ready")
+            ) or "empty",
+            "count": 0,
+        },
+    ]
+    pins = [
+        {
+            "lane": "agent", "severity": "high", "kind": "cron_fail",
+            "ts": f.get("at"), "title": f"cron failed: {f['name']}",
+        }
+        for f in crons["jobs"]
+    ]
+    return {
+        "ok": True,
+        "as_of": _now_iso(),
+        "signals": signals,
+        "pins": pins[:5],
+        "kanban": kb,
+    }
+
+
+# ===========================================================================
+# Telegram channel sources (kind='telegram') — free t.me/s preview scrape.
+# Public channel preview page (https://t.me/s/<username>) renders recent posts
+# as HTML WITHOUT login: each message carries data-post="<user>/<id>",
+# <time datetime="ISO">, and a .tgme_widget_message_text block. Zero creds,
+# zero cost, no X API. Refresh branch in refresh_source().
+# ===========================================================================
+_TG_PREVIEW_NAME = "Telegram Channel"   # feed.get("format") label
+
+
+def _tg_username(feed_url: str) -> str:
+    return urlsplit(feed_url).path.rstrip("/").split("/")[-1] or ""
+
+
+def _parse_telegram_preview(username: str, body: bytes) -> list[dict[str, Any]]:
+    """Parse a t.me/s/<username> preview page into plugin entry dicts.
+
+    Message boundaries come from consecutive ``data-post`` markers so each
+    block reliably holds that message's own ``<time datetime>`` (a naive
+    fixed-width window misses it on long posts and silently yields NULL).
+    """
+    txt = body.decode("utf-8", "replace")
+    markers = list(re.finditer(r'data-post="([^"/]+)/(\d+)"', txt))
+    entries: dict[str, dict[str, Any]] = {}
+    for i, m in enumerate(markers):
+        chan, mid = m.group(1), m.group(2)
+        start = m.start()
+        end = markers[i + 1].start() if i + 1 < len(markers) else min(len(txt), start + 16000)
+        block = txt[start:end]
+        pub = None
+        tm = re.search(r"<time datetime=\"([^\"]+)\"", block)
+        if tm:
+            pub = tm.group(1).replace("Z", "+00:00")
+        text = ""
+        tmm = re.search(r"tgme_widget_message_text[^>]*>(.*?)</div>", block, re.S)
+        if tmm:
+            text = strip_html(tmm.group(1))
+        text = _WS_RE.sub(" ", text).strip()
+        # Skip pure media / sticker noise and non-post wrappers.
+        if not text or text.startswith(("t.me/", "Join Channel")):
+            continue
+        guid = f"tg-{chan.lower()}-{mid}"
+        entries[guid] = {
+            "guid": guid,
+            "link": f"https://t.me/{chan}/{mid}",
+            "title": text[:180] or "(telegram message)",
+            "summary": text[:2000],
+            "author": username,
+            "published": pub,
+        }
+    return sorted(entries.values(), key=lambda e: int(e["guid"].rsplit("-", 1)[-1]), reverse=True)
+
+
+async def _refresh_telegram_source(source_id: int, row: sqlite3.Row) -> dict[str, Any]:
+    """Fetch t.me/s preview, parse posts, insert via the shared dedup ladder."""
+    username = _tg_username(row["feed_url"])
+    now = _now_iso()
+
+    def _fail(msg: str) -> dict[str, Any]:
+        with _db() as conn:
+            conn.execute(
+                "UPDATE sources SET last_checked_at=?, last_error=?, error_count=error_count+1, updated_at=? WHERE id=?",
+                (now, msg[:500], now, source_id),
+            )
+        return {"source_id": source_id, "ok": False, "error": msg[:500]}
+
+    if not username:
+        return _fail("telegram source needs feed_url like https://t.me/s/<username>")
+    try:
+        outcome = await _http_fetch(row["feed_url"], headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
+    except Exception as exc:
+        return _fail(f"fetch failed: {exc}")
+    if outcome.status != 200:
+        return _fail(f"HTTP {outcome.status} fetching {row['feed_url']}")
+
+    entries = _parse_telegram_preview(username, outcome.body)
+    added = _insert_articles(source_id, row["feed_url"], {"title": row["name"] or username, "entries": entries})
+    with _db() as conn:
+        if added:
+            conn.execute("UPDATE sources SET articles_ever = articles_ever + ? WHERE id=?", (added, source_id))
+        conn.execute(
+            """UPDATE sources SET last_checked_at=?, last_success_at=?, last_error=NULL,
+               error_count=0, updated_at=? WHERE id=?""",
+            (now, now, now, source_id),
+        )
+        _apply_retention(conn)
+    return {
+        "source_id": source_id,
+        "ok": True,
+        "added": added,
+        "format": "telegram",
+        "preview_posts": len(entries),
+    }

@@ -56,6 +56,38 @@ Source URLs are untrusted: http/https only (no file/ftp), loopback/private/link-
 
 Ticker enabled · scroll speed · **text size 9–20px** (strip height follows) · pause on hover · show source · relative time · only-unread · max article age · max headlines · refresh interval (30s–24h, default 5min). Conditional GETs (ETag/Last-Modified → 304) keep polling cheap.
 
+## Signal lanes (2026-09-17 desktop build)
+
+The ticker is now a **three-lane strip**: news · trades · agent. Lane toggles, watchlist, HL address, notification and pin settings live in Settings → Signal lanes / Signals.
+
+- **Trades lane** — live Hyperliquid snapshot via the public info API (zero keys): open positions with uPnL/lev/liq-distance/conviction, or *Flat · acct $X · last fill* when flat. Handles the HIP-3 builder clearinghouses (`perpDexs` merge) so `xyz:`/`flx:`/etc. positions never vanish; conviction overlay from `~/.hermes/hl_state/entry_signals.json`. Poll interval default 60s.
+- **Agent lane** — Hermes health: cron failures (24h, from every profile's `executions.db` + `jobs.json` failure streaks), gateway heartbeat age, scheduler ticker age, kanban board churn.
+- **Health rail** — four non-scrolling dots (cron/gateway/ticker/board) pinned left of the marquee; click → Agent tab.
+- **Alert pins** — high-severity items (watchlist matches + cron failures) pin as a `⚠ n` chip instead of scrolling past.
+- **Watchlist lens** — keyword watchlist (default `HYPE BTC ETH SOL`): matched headlines are accent-highlighted in the strip, listed in the Watchlist tab, and can fire a desktop notification.
+- **Ask Hermes (bonus)** — ⌘K *Newswire: Ask Hermes About Last Item*, plus right-click / long-press on any lane item: sends a context-aware prompt to the focused chat (`prompt.submit`).
+
+### New backend routes
+
+| Route | Purpose |
+|---|---|
+| `GET /trades` | Cached HL snapshot (positions across dexes, spot, fills, conviction) |
+| `GET /agent/health` | Signals + high-severity pins from cron/heartbeat/kanban |
+| `GET /articles?watch=1` / `?severity=high` | Watchlist / severity filters; every article gains `watch` + `severity` |
+
+### New settings
+
+`ticker_lanes {news,trades,agent}` · `hl_address` (0x + 40 hex) · `hl_poll_interval` (15–3600s) · `watchlist` (string list) · `notify_on_watch` (bool) · `pins_enabled` (bool)
+
+## Telegram channel sources (v0.3.0-dev, 2026-09-17)
+
+Free X alternative: public Telegram channels via their **`t.me/s/<username>` preview page** — no credentials, no API cost (X's API went pay-per-use, $0.005/post read). Channels render recent posts as HTML with `data-post` IDs + ISO timestamps; the backend scrapes + parses them into normal articles, so everything the ticker supports (read state, watchlist highlight, pins, Ask-Hermes) works on TG posts.
+
+- **Add one in the UI**: Settings → Latest/Sources → paste `https://t.me/<user>` or `https://t.me/s/<user>` — instant add (kind auto-detected). Or `POST /sources {kind: "telegram", feed_url: "https://t.me/s/<user>"}`.
+- Works for channels that expose the public preview widget. If a channel has preview disabled the page returns no posts and the source stays quiet — pick a different channel.
+- Per-source `refresh_interval` default 900s to be polite to t.me; first refresh ingests ~10–20 recent posts, dedup holds thereafter (stale posts older than `max_article_age_hours` are pruned by retention as usual).
+- Starter set wired on Guy's box: `WatcherGuru`, `CoinTelegraph`, `@utoday_en`, `@glassnode` (category `telegram-crypto`).
+
 ## Test & verify
 
 ```bash
@@ -65,4 +97,4 @@ node --check desktop/plugin.js
 
 ## Status
 
-v0.1.0 — feature-complete through M5 (backend, page, ticker, hardening) with an independent QA gate (M6). Built as a standalone unified plugin against Hermes Desktop v0.21.x plugin SDK.
+v0.1.0 — feature-complete through M5 (backend, page, ticker, hardening) with an independent QA gate (M6). v0.2.0-dev — signal lanes build (trades · agent · alerts · watchlist · ask-Hermes). Built as a standalone unified plugin against Hermes Desktop v0.21.x plugin SDK.
